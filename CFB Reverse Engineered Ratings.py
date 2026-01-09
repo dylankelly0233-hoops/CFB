@@ -51,6 +51,12 @@ def get_cfbd_data(endpoint, params=None):
 if st.button("🚀 Run Model"):
     with st.spinner("Fetching Data from CFBD..."):
         # 1. FETCH DATA
+        # A. Get Team Info (To filter FBS)
+        teams_json = get_cfbd_data('/teams', {'year': year})
+        # Create a set of ONLY FBS schools
+        fbs_teams = {t['school'] for t in teams_json if t.get('classification') == 'fbs'}
+        
+        # B. Get Games
         games_reg = get_cfbd_data('/games', {'year': year, 'seasonType': 'regular'})
         games_post = get_cfbd_data('/games', {'year': year, 'seasonType': 'postseason'})
 
@@ -60,7 +66,7 @@ if st.button("🚀 Run Model"):
             h, a = g.get('home_team'), g.get('away_team')
             game_info_map[f"{h}_{a}"] = g.get('neutral_site', False)
 
-        # Fetch Lines
+        # C. Fetch Lines
         lines_reg = get_cfbd_data('/lines', {'year': year, 'seasonType': 'regular'})
         for g in lines_reg: g['_season_type'] = 'regular'
 
@@ -69,7 +75,7 @@ if st.button("🚀 Run Model"):
 
         lines_raw = lines_reg + lines_post
 
-        # Fetch SP+ Priors
+        # D. Fetch SP+ Priors
         sp_json = get_cfbd_data('/ratings/sp', {'year': year})
         sp_map = {item['team']: item['rating'] for item in sp_json}
 
@@ -85,8 +91,15 @@ if st.button("🚀 Run Model"):
         for g in lines_raw:
             week = g.get('week', 0)
             sType = g.get('_season_type')
+            
+            home, away = g.get('homeTeam'), g.get('awayTeam')
 
-            # Filter Logic
+            # --- FILTER: REMOVE FCS vs FCS ---
+            # If NEITHER team is in our fbs_teams list, skip the game.
+            if home not in fbs_teams and away not in fbs_teams:
+                continue
+
+            # Standard Logic
             if is_postseason:
                 if sType == 'postseason' and week >= target_week: continue
             else:
@@ -96,7 +109,7 @@ if st.button("🚀 Run Model"):
             lines = g.get('lines', [])
             if not lines: continue
 
-            # Find a valid provider (priority list or just take first)
+            # Find a valid provider
             spread_val = None
             for provider in lines:
                 if provider.get('spread') is not None:
@@ -105,7 +118,6 @@ if st.button("🚀 Run Model"):
 
             if spread_val is None: continue
 
-            home, away = g.get('homeTeam'), g.get('awayTeam')
             is_neutral = game_info_map.get(f"{home}_{away}", False)
 
             # Weight Decay
@@ -126,18 +138,19 @@ if st.button("🚀 Run Model"):
             count_games += 1
 
         # B. Inject Priors (SP+)
-        # Fallback if no games
         if count_games == 0:
             current_prior_weight = 10.0
 
         for team, rating in sp_map.items():
-            matchups.append({
-                'home_team': team,
-                'away_team': 'LEAGUE_AVERAGE_DUMMY',
-                'spread': -1 * rating,
-                'is_neutral': True,
-                'weight': current_prior_weight
-            })
+            # Only add priors for FBS teams to keep the matrix clean
+            if team in fbs_teams:
+                matchups.append({
+                    'home_team': team,
+                    'away_team': 'LEAGUE_AVERAGE_DUMMY',
+                    'spread': -1 * rating,
+                    'is_neutral': True,
+                    'weight': current_prior_weight
+                })
 
         df = pd.DataFrame(matchups)
 
@@ -183,8 +196,11 @@ if st.button("🚀 Run Model"):
 
         for g in target_slate:
             home, away = g.get('homeTeam'), g.get('awayTeam')
+            
+            # --- FILTER TARGET SLATE TOO ---
+            if home not in fbs_teams and away not in fbs_teams:
+                continue
 
-            # Get Vegas Line
             lines = g.get('lines', [])
             if not lines: continue
             spread_val = None
@@ -198,43 +214,24 @@ if st.button("🚀 Run Model"):
             h_r = team_ratings.get(home, 0.0)
             a_r = team_ratings.get(away, 0.0)
 
-            is_neutral = game_info_map.get(f"{home}_{away}", True)  # Default to neutral if unknown in post
+            is_neutral = game_info_map.get(f"{home}_{away}", True)
             hfa = 0.0 if is_neutral else implied_hfa
 
-            # Model Calc
-            # Spread = (Home - Away + HFA) * -1 (because negative is home favored)
             raw_margin = h_r - a_r + hfa
             model_spread = -raw_margin
 
-            # Edge Calculation
-            # If Model says -10, Vegas says -7. Edge = 3 points (Model likes Home more)
-            # If Model says -3, Vegas says -7. Edge = -4 points (Model likes Away)
-            # Edge > 0: Value on Home? No, let's normalize.
-
-            # Simplified Logic:
-            # Model: Home -10
-            # Vegas: Home -7
-            # We think Home wins by MORE. Bet Home.
-
-            # Compare Margins (Positive = Home Wins by X)
             model_margin = raw_margin
-            vegas_margin = -vegas_spread  # Convert -7 spread to +7 margin
+            vegas_margin = -vegas_spread
 
             edge = model_margin - vegas_margin
-            # If Edge > 0: Model thinks Home scores MORE than Vegas thinks. -> Bet Home.
-            # If Edge < 0: Model thinks Home scores LESS than Vegas thinks. -> Bet Away.
-
-            # --- KEY NUMBER LOGIC ---
-            # Check if the "middle" crosses 3 or 7
+            
             is_key_cross = False
-            # Check between Model and Vegas
             m_spread = model_spread
             v_spread = vegas_spread
 
-            # Did we cross 3? (e.g. Model -4, Vegas -2)
             if (m_spread < -3 and v_spread > -3) or (m_spread > -3 and v_spread < -3): is_key_cross = True
             if (m_spread < -7 and v_spread > -7) or (m_spread > -7 and v_spread < -7): is_key_cross = True
-            if (m_spread < 3 and v_spread > 3) or (m_spread > 3 and v_spread < 3): is_key_cross = True  # Favorites flip
+            if (m_spread < 3 and v_spread > 3) or (m_spread > 3 and v_spread < 3): is_key_cross = True
 
             req_edge = thresh_key if is_key_cross else thresh_std
 
@@ -269,13 +266,11 @@ if st.button("🚀 Run Model"):
             st.subheader("💰 Betting Board")
             proj_df = pd.DataFrame(projections)
             if not proj_df.empty:
-                # Color Coding
                 def color_signal(val):
                     color = 'white'
                     if "BET" in str(val):
-                        color = '#d4edda'  # Light Green
+                        color = '#d4edda'
                     return f'background-color: {color}; color: black'
-
 
                 st.dataframe(
                     proj_df.style.applymap(color_signal, subset=['Signal'])
@@ -284,7 +279,6 @@ if st.button("🚀 Run Model"):
                     use_container_width=True
                 )
 
-                # Download
                 buffer = io.BytesIO()
                 with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
                     proj_df.to_excel(writer, sheet_name='Projections', index=False)
@@ -292,7 +286,7 @@ if st.button("🚀 Run Model"):
 
                 st.download_button(
                     label="📥 Download Excel Report",
-                    data=buffer,
+                    data=buffer.getvalue(),
                     file_name=f"CFB_Projections_Week_{target_week}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
